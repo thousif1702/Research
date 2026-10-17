@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""./run <items.json> --budget <1x|3x|10x> --out <answers.json> [--trace trace.json]
+
+Pipeline (one file):
+  1. parse_header   header -> people / blocks / stations / station-holders      (symbolic)
+  2. extract        Granite turns each note line into a constraint or NONE      (MODEL)
+                    budget k = 1/3/10 samples per item; per-line plurality vote
+  3. parse_reply    model text -> validated constraint tuples                   (string match)
+  4. Model.solutions enumerate every consistent schedule                        (symbolic)
+  5. kind = 0 -> inconsistent, 1 -> unique, >=2 -> ambiguous
+  6. minimal_core   deletion-based minimal unsatisfiable set of lines           (symbolic)
+
+The model never sees the kind question; it only reads sentences. Python 3.11.
+"""
+import argparse
+import itertools
+import json
+import os
+import re
+import sys
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# --------------------------------------------------------------------------- config
+
+
+def load_env():
+    env = dict(os.environ)
+    p = os.path.join(HERE, ".env")
+    if os.path.exists(p):
+        for line in open(p, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    return env
+
+
+# --------------------------------------------------------------------------- header
+
+def parse_header(text):
+    rows = text.split("\n")
+    header = rows[0]
+    body = [l for l in rows[1:] if l.strip()]
+    grab = lambda pat: (re.search(pat, header + " ", re.S) or [None, ""])[1]
+    split = lambda s: [x.strip() for x in s.split(",") if x.strip()]
+    return {
+        "people": split(grab(r"rota:\s*(.*?)\.\s")),
+        "blocks": split(grab(r"Blocks run\s*(.*?)\s*,\s*one person")),
+        "stations": split(grab(r"one person on each:\s*(.*?)\.")),
+        "station_people": split(grab(r"people on a station are\s*(.*?);")),
+        "lines": list(enumerate(body, start=1)),   # (1-based line no., verbatim line)
+    }
+
+
+# --------------------------------------------------------------------------- solver
+# Constraint tuples (an entity is a person, or a station meaning "whoever holds it"):
+#   BLOCK p b | NOT_BLOCK p b | STATION p s | NOT_STATION p s
+#   BEFORE x y (x at an earlier block, any gap) | DIRECTLY_BEFORE x y
+#   BETWEEN p a b (p strictly between a and b, either order)
+ARITY = {"BLOCK": 2, "NOT_BLOCK": 2, "STATION": 2, "NOT_STATION": 2,
+         "BEFORE": 2, "DIRECTLY_BEFORE": 2, "BETWEEN": 3}
+
+
+class World:
+    def __init__(self, hdr):
+        self.people, self.blocks = hdr["people"], hdr["blocks"]
+        self.stations, sp = hdr["stations"], hdr["station_people"]
+        self.worlds = []
+        for perm in itertools.permutations(range(len(self.blocks)), len(self.people)):
+            pos = dict(zip(self.people, perm))
+            for hp in itertools.permutations(sp, len(self.stations)):
+                self.worlds.append((pos, dict(zip(self.stations, hp))))
+        self.full = (1 << len(self.worlds)) - 1
+        self._cache = {}
+
+    @staticmethod
+    def _at(w, e):
+        pos, holder = w
+        return pos[e] if e in pos else pos[holder[e]]
+
+    def mask(self, c):
+        """Bitmask over worlds in which constraint c holds."""
+        if c in self._cache:
+            return self._cache[c]
+        t, bi = c[0], {b: i for i, b in enumerate(self.blocks)}
+
+        def ok(w):
+            pos, holder = w
+            if t == "BLOCK":
+                return pos[c[1]] == bi[c[2]]
+            if t == "NOT_BLOCK":
+                return pos[c[1]] != bi[c[2]]
+            if t == "STATION":
+                return holder[c[2]] == c[1]
+            if t == "NOT_STATION":
+                return holder[c[2]] != c[1]
+            if t == "BEFORE":
+                return self._at(w, c[1]) < self._at(w, c[2])
+            if t == "DIRECTLY_BEFORE":
+                return self._at(w, c[1]) + 1 == self._at(w, c[2])
+            p, a, b = (self._at(w, e) for e in c[1:])       # BETWEEN
+            return a < p < b or b < p < a
+
+        m = 0
+        for i, w in enumerate(self.worlds):
+            if ok(w):
+                m |= 1 << i
+        self._cache[c] = m
+        return m
+
+    def sat(self, cons):
+        m = self.full
+        for c in cons:
+            m &= self.mask(c)
+            if not m:
+                break
+        return m
+
+    def solutions(self, cons):
+        m = self.sat(cons)
+        return [w for i, w in enumerate(self.worlds) if m >> i & 1]
+
+    def render(self, w):
+        pos, holder = w
+        out = {p: {"block": self.blocks[pos[p]]} for p in self.people}
+        for s, p in holder.items():
+            out[p]["station"] = s
+        return out
+
+
+def minimal_core(world, line_cons):
+    """Smallest-by-deletion set of line numbers that cannot all hold, any one of
+    which can be dropped to make the rest satisfiable."""
+    flat = lambda ns: [c for n in ns for c in line_cons[n]]
+    keep = sorted(line_cons)
+    for n in list(keep):
+        trial = [k for k in keep if k != n]
+        if not world.sat(flat(trial)):
+            keep = trial
+    return keep
+
+
+def solve(text, line_cons, cite_all=False):
+    hdr = parse_header(text)
+    world = World(hdr)
+    sols = world.solutions([c for cs in line_cons.values() for c in cs])
+    lines = dict(hdr["lines"])
+    if not sols:
+        core = sorted(line_cons) if cite_all else minimal_core(world, line_cons)
+        return {"case": "inconsistent", "conflicts": [lines[n] for n in core]}, 0
+    if len(sols) == 1:
+        return {"case": "unique", "assignment": world.render(sols[0])}, 1
+    return {"case": "ambiguous", "assignments": [world.render(s) for s in sols]}, len(sols)
+
+
+# --------------------------------------------------------------------------- model
+
+HEAD = """You convert one line of facility shift notes at a time into a formal constraint.
+
+People: {people}
+Blocks (in time order): {blocks}
+Stations: {stations}
+
+Constraint forms (use names, blocks and station names exactly as written above):
+  BLOCK <person> <block>              the person works that block
+  NOT_BLOCK <person> <block>          the person does NOT work that block
+  STATION <person> <station>          the person holds that station
+  NOT_STATION <person> <station>      the person does not hold that station
+  BEFORE <x> <y>                      x works at an earlier block than y, any gap. x or y may be
+                                      a station, meaning whoever holds it
+  DIRECTLY_BEFORE <x> <y>             x works the block immediately before y
+  BETWEEN <middle> <end1> <end2>      <middle> works strictly between the other two, whichever
+                                      way round they are
+  NONE                                the line states none of the above
+"""
+
+RULES = """
+Rules:
+- Hedges ("I believe", "as far as I know", "speaking from memory", ...) change nothing: a hedged
+  fact is still a fact. Drop the hedge and encode the fact.
+- A line that restates another line ("It bears repeating: ...") is encoded the same way.
+- NOT_BLOCK also covers: unavailable, ruled out, and asked/lobbied/put in for a block but
+  was turned down or did not get it.
+- NOT_STATION also covers "someone other than X covers the station".
+- A station word (intake, calibration, packing) means STATION or NOT_STATION, never a block.
+- For BEFORE and DIRECTLY_BEFORE the entity who works FIRST is written first.
+  "earlier than", "before", "done before X starts", "precedes", "has already been on by the
+  time X starts" -> the earlier person first.
+  "later than", "after", "takes over from", "relieves", "hands over to" -> work out who is
+  earlier and write that one first.
+- Use NONE for chatter, errands, who attended or holds a key, wishes about how things could
+  have been, things true only in the past ("last month", "in the old arrangement", "in the
+  spring"), counterfactuals ("if X had...", "had the rota gone the other way"), and remarks
+  that nobody could remember something. Only encode a fact the line actually states.
+"""
+
+EXAMPLES = """
+Examples (invented people and wording, for illustration only):
+ 1. Dev has a clash that rules out the 09:00 block.                   -> NOT_BLOCK Dev 09:00
+ 2. Kim asked for 15:00 but the request was refused.                   -> NOT_BLOCK Kim 15:00
+ 3. As things stand, Kim has the 11:00 block.                          -> BLOCK Kim 11:00
+ 4. 13:00 is the one block Ora is definitely not on.                   -> NOT_BLOCK Ora 13:00
+ 5. Whoever drew the 07:00 block, it was Lee.                          -> BLOCK Lee 07:00
+ 6. Packing is Dev's job.                                              -> STATION Dev packing
+ 7. Ora has intake this week.                                          -> STATION Ora intake
+ 8. Ora is not on calibration.                                         -> NOT_STATION Ora calibration
+ 9. Calibration is covered by someone other than Kim.                  -> NOT_STATION Kim calibration
+10. Kim is on after one of Lee and Ora and before the other.           -> BETWEEN Kim Lee Ora
+11. Dev's block falls between Kim's and Lee's, in one order or other.  -> BETWEEN Dev Kim Lee
+12. Whichever way round Lee and Ora are, Kim is between them.          -> BETWEEN Kim Lee Ora
+13. Whoever has packing is done before Lee starts.                     -> BEFORE packing Lee
+14. The intake station is covered earlier in the day than Kim's block. -> BEFORE intake Kim
+15. Lee is on later than whoever has intake.                           -> BEFORE intake Lee
+16. Dev comes later in the day than Ora.                               -> BEFORE Ora Dev
+17. By the time Ora starts, Kim has already been on.                   -> BEFORE Kim Ora
+18. Lee takes over from Dev later in the day.                          -> BEFORE Dev Lee
+19. Kim's block falls somewhere earlier than Lee's.                    -> BEFORE Kim Lee
+20. Kim relieves Dev directly, with nothing in between.                -> DIRECTLY_BEFORE Dev Kim
+21. Ora then Lee, back to back.                                        -> DIRECTLY_BEFORE Ora Lee
+22. Dev is on the block directly after Kim.                            -> DIRECTLY_BEFORE Kim Dev
+23. If Lee had been on 07:00 things would have run smoother.           -> NONE
+24. Last month Ora was on packing.                                     -> NONE
+25. The printer is jammed again.                                       -> NONE
+"""
+
+TAIL = """
+Answer with exactly one line per numbered note, in the form "<number>: <constraint>", and
+nothing else.
+
+Notes:
+{notes}
+"""
+
+DIRECT = """Below are shift notes for a facility. Some lines are chatter; the rest constrain who
+works which block and which station.
+
+{text}
+
+Decide whether exactly one assignment fits the notes ("unique"), several do ("ambiguous"), or
+none ("inconsistent"). Reply with JSON only, in one of these forms:
+{{"case": "unique", "assignment": {{"<name>": {{"block": "<block>", "station": "<station>"}}}}}}
+{{"case": "ambiguous", "assignments": [{{...}}, {{...}}]}}
+{{"case": "inconsistent", "conflicts": ["<line quoted verbatim>", "..."]}}
+Give "station" only for people the header puts on a station.
+"""
+
+
+def make_client(env):
+    from openai import OpenAI
+    return OpenAI(base_url=env["OPENROUTER_BASE_URL"], api_key=env["OPENROUTER_API_KEY"],
+                  max_retries=0, timeout=180)
+
+
+def build_prompt(item, hdr, ablate):
+    if "direct" in ablate:
+        return DIRECT.format(text=item["text"])
+    notes = "\n".join(f"{n}. {l}" for n, l in hdr["lines"])
+    head = HEAD.format(people=", ".join(hdr["people"]), blocks=", ".join(hdr["blocks"]),
+                       stations=", ".join(hdr["stations"]))
+    return (head + ("" if "no_rules" in ablate else RULES)
+            + ("" if "no_examples" in ablate else EXAMPLES) + TAIL.format(notes=notes))
+
+
+def call_model(client, model, item_id, prompt):
+    r = client.chat.completions.create(
+        model=model, messages=[{"role": "user", "content": prompt}],
+        temperature=1.0, top_p=0.95, max_tokens=1500,
+        extra_headers={"X-Item-Id": item_id},
+        extra_body={"reasoning": {"enabled": False}})
+    return r.choices[0].message.content or ""
+
+
+# --------------------------------------------------------------------------- parsing
+
+def parse_reply(reply, hdr):
+    """Model text -> {line_no: constraint tuple or None}. Unusable lines -> None."""
+    canon = {}
+    for e in hdr["people"] + hdr["stations"] + hdr["blocks"]:
+        canon[e.lower()] = e
+    is_p, is_s, is_b = set(hdr["people"]), set(hdr["stations"]), set(hdr["blocks"])
+    out = {}
+    for row in reply.splitlines():
+        m = re.match(r"^\s*(\d+)\s*[:.)\-]\s*(.*)$", row)
+        if not m:
+            continue
+        n, rest = int(m.group(1)), m.group(2)
+        toks = [t for t in re.split(r"[\s,|]+", rest.strip()) if t]
+        if not toks:
+            continue
+        typ = toks[0].upper().strip("*`")
+        args = [canon.get(re.sub(r"'s$", "", t.strip(".;*`()")).lower()) for t in toks[1:]]
+        if typ not in ARITY or len(args) < ARITY[typ] or None in args[:ARITY[typ]]:
+            out[n] = None
+            continue
+        a = args[:ARITY[typ]]
+        if typ in ("BLOCK", "NOT_BLOCK"):                     # tolerate swapped order
+            a.sort(key=lambda e: e in is_b)
+            ok = a[0] in is_p and a[1] in is_b
+        elif typ in ("STATION", "NOT_STATION"):
+            a.sort(key=lambda e: e in is_s)
+            ok = a[0] in set(hdr["station_people"]) and a[1] in is_s
+        else:
+            ok = all(e in is_p or e in is_s for e in a) and len(set(a)) == len(a)
+        out[n] = (typ, *a) if ok else None
+    return out
+
+
+def vote(parses, line_nos):
+    """Per-line plurality over samples; each sample's NONE/unusable counts as a vote."""
+    chosen = {}
+    for n in line_nos:
+        c = Counter(p.get(n) for p in parses)
+        top, _ = max(c.items(), key=lambda kv: kv[1])
+        if top is not None:
+            chosen[n] = [top]
+    return chosen
+
+
+# --------------------------------------------------------------------------- main
+
+def parse_direct(reply):
+    """Model-only baseline: pull the JSON answer out of a free-text reply."""
+    m = re.search(r"\{.*\}", reply, re.S)
+    try:
+        d = json.loads(m.group(0))
+        if isinstance(d, dict) and d.get("case") in ("unique", "ambiguous", "inconsistent"):
+            return d
+    except Exception:
+        pass
+    return {"case": "unique", "assignment": {}}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("items")
+    ap.add_argument("--budget", required=True, choices=["1x", "3x", "10x"])
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--trace", help="optional: write raw model replies and constraints here")
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--ablate", default="",
+                    help="comma list for the ablation study: no_examples, no_rules, "
+                         "cite_all, direct (model-only, no solver)")
+    a = ap.parse_args()
+
+    k = int(a.budget[:-1])
+    ablate = set(x for x in a.ablate.split(",") if x)
+    env = load_env()
+    client, model = make_client(env), env.get("MODEL", "ibm-granite/granite-4.2-8b")
+    items = json.load(open(a.items, encoding="utf-8"))
+    hdrs = {it["id"]: parse_header(it["text"]) for it in items}
+    prompts = {it["id"]: build_prompt(it, hdrs[it["id"]], ablate) for it in items}
+
+    def one(job):
+        iid, _ = job
+        try:
+            return call_model(client, model, iid, prompts[iid])
+        except Exception as e:                      # a failed call is not retried: budget
+            print(f"[warn] {iid}: {type(e).__name__}: {e}", file=sys.stderr)
+            return ""
+
+    jobs = [(it["id"], s) for it in items for s in range(k)]
+    with ThreadPoolExecutor(a.workers) as ex:
+        replies = list(ex.map(one, jobs))
+    by_item = {}
+    for (iid, _), r in zip(jobs, replies):
+        by_item.setdefault(iid, []).append(r)
+
+    answers, trace = {}, {}
+    for it in items:
+        iid, hdr = it["id"], hdrs[it["id"]]
+        if "direct" in ablate:
+            votes = Counter(json.dumps(parse_direct(r), sort_keys=True) for r in by_item[iid])
+            answers[iid] = json.loads(votes.most_common(1)[0][0])
+            trace[iid] = {"replies": by_item[iid]}
+            continue
+        parses = [parse_reply(r, hdr) for r in by_item[iid]]
+        line_cons = vote(parses, [n for n, _ in hdr["lines"]])
+        try:
+            answers[iid], nsol = solve(it["text"], line_cons, cite_all="cite_all" in ablate)
+        except Exception as e:
+            print(f"[warn] {iid}: solve failed: {e}", file=sys.stderr)
+            answers[iid], nsol = {"case": "unique", "assignment": {}}, -1
+        trace[iid] = {"replies": by_item[iid], "constraints": {n: c for n, c in line_cons.items()},
+                      "n_solutions": nsol}
+    json.dump(answers, open(a.out, "w", encoding="utf-8"), indent=1)
+    if a.trace:
+        json.dump(trace, open(a.trace, "w", encoding="utf-8"), indent=1)
+    print(f"wrote {len(answers)} answers to {a.out}  (budget {a.budget}, {len(jobs)} model calls)")
+
+
+if __name__ == "__main__":
+    main()

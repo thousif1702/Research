@@ -1,0 +1,26 @@
+# Built and tested on Python 3.11.4 (Windows 11). Anything 3.10+ should be fine.
+#
+# The only thing this project really needs is the OpenAI client, because the
+# provided endpoint speaks the OpenAI chat-completions protocol. Everything else
+# (the solver, the parsing, the scoring) is plain standard library.
+#
+# I pinned the client and the packages it pulls in so a re-run behaves the same
+# way mine did.
+
+openai==2.7.1
+
+# installed automatically by openai, pinned only for reproducibility
+anyio==4.9.0
+distro==1.9.0
+httpx==0.28.1
+httpcore==1.0.9
+h11==0.16.0
+idna==3.10
+certifi==2025.10.5
+jiter==0.10.0
+pydantic==2.9.2
+pydantic_core==2.23.4
+annotated-types==0.7.0
+sniffio==1.3.1
+tqdm==4.67.1
+typing_extensions==4.15.0
